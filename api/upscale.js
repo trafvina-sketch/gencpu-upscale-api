@@ -10,20 +10,52 @@ try {
   ffmpegPath = require('ffmpeg-static') || 'ffmpeg';
 } catch (e) {}
 
-function downloadToFile(urlStr, destPath) {
+function downloadToFile(urlStr, destPath, timeoutMs = 25000) {
   return new Promise((resolve, reject) => {
     const mod = urlStr.startsWith('https') ? https : http;
-    mod.get(urlStr, (res) => {
+    const req = mod.get(urlStr, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0' },
+      timeout: timeoutMs
+    }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return downloadToFile(res.headers.location, destPath).then(resolve).catch(reject);
+        res.resume();
+        return downloadToFile(res.headers.location, destPath, timeoutMs).then(resolve).catch(reject);
       }
-      if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
       const ws = fs.createWriteStream(destPath);
       res.pipe(ws);
       ws.on('finish', () => ws.close(() => resolve(destPath)));
       ws.on('error', reject);
-    }).on('error', reject);
+    });
+    req.on('timeout', () => { req.destroy(new Error('Download timeout')); });
+    req.on('error', reject);
   });
+}
+
+async function downloadParallelRanges(urlStr, destPath) {
+  const headRes = await fetch(urlStr, { method: 'HEAD' });
+  const totalSize = Number(headRes.headers.get('content-length') || 0);
+  if (!headRes.ok || totalSize < 500000) {
+    return downloadToFile(urlStr, destPath, 25000);
+  }
+  const PARTS = 8;
+  const partSize = Math.ceil(totalSize / PARTS);
+  const buffers = await Promise.all(
+    Array.from({ length: PARTS }, async (_, idx) => {
+      const start = idx * partSize;
+      const end = Math.min(totalSize - 1, (idx + 1) * partSize - 1);
+      const r = await fetch(urlStr, {
+        headers: { Range: `bytes=${start}-${end}` }
+      });
+      if (!r.ok && r.status !== 206) throw new Error(`Range ${idx} HTTP ${r.status}`);
+      return Buffer.from(await r.arrayBuffer());
+    })
+  );
+  fs.writeFileSync(destPath, Buffer.concat(buffers));
+  return destPath;
 }
 
 function probeVideoDimensions(filePath) {
@@ -155,7 +187,16 @@ async function handler(req, res) {
 
   try {
     const tDl0 = Date.now();
-    await downloadToFile(sourceUrl, inPath);
+    let downloaded = false;
+    if (body.cdnUrl) {
+      try {
+        await downloadToFile(body.cdnUrl, inPath, 12000);
+        if (fs.existsSync(inPath) && fs.statSync(inPath).size > 20000) downloaded = true;
+      } catch (e) {}
+    }
+    if (!downloaded) {
+      await downloadParallelRanges(sourceUrl, inPath);
+    }
     const dlMs = Date.now() - tDl0;
 
     const dims = await probeVideoDimensions(inPath);
