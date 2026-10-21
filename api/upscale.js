@@ -196,7 +196,7 @@ async function handler(req, res) {
       : `scale=${targetW}:${targetH}:flags=lanczos,unsharp=3:3:0.85:3:3:0.0`;
     const crfVal = is4K ? '20' : '18';
     const args = [
-      '-y', '-hide_banner',
+      '-y', '-hide_banner', '-nostats', '-loglevel', 'error',
       '-threads', '0',
       '-i', inPath,
       '-vf', vf,
@@ -215,7 +215,7 @@ async function handler(req, res) {
 
     const code = await new Promise((resolve) => {
       const proc = spawn(ffmpegPath, args, {
-        stdio: ['ignore', 'ignore', 'pipe'],
+        stdio: 'ignore',
         env: { ...process.env, MALLOC_ARENA_MAX: '2' }
       });
       proc.on('close', c => resolve(c ?? -1));
