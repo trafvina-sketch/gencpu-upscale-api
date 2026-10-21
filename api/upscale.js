@@ -80,12 +80,13 @@ function probeVideoDimensions(filePath) {
 
 async function uploadFileInChunks(filePath, callbackBaseUrl) {
   const buf = fs.readFileSync(filePath);
-  const CHUNK_SIZE = 3 * 1024 * 1024; // 3MB per chunk
+  const CHUNK_SIZE = 3800 * 1024; // ~3.8MB per chunk (fits under 4.5MB limit, fewer chunks)
   const totalChunks = Math.max(1, Math.ceil(buf.length / CHUNK_SIZE));
   const sep = callbackBaseUrl.includes('?') ? '&' : '?';
 
-  // Upload chunks in parallel batches of 5 for 4x faster transfer to cPanel
-  const CONCURRENCY = 5;
+  // Upload up to 8 chunks in a single parallel wave for maximum throughput
+  const CONCURRENCY = 8;
+  let assembledAutomatically = false;
   for (let start = 0; start < totalChunks; start += CONCURRENCY) {
     const batch = [];
     for (let i = start; i < Math.min(totalChunks, start + CONCURRENCY); i++) {
@@ -96,19 +97,23 @@ async function uploadFileInChunks(filePath, callbackBaseUrl) {
           method: 'POST',
           headers: { 'Content-Type': 'application/octet-stream' },
           body: slice
-        }).then(r => {
+        }).then(async r => {
           if (!r.ok) throw new Error(`Upload chunk ${i + 1}/${totalChunks} failed: HTTP ${r.status}`);
+          const j = await r.json().catch(() => null);
+          if (j && j.done) assembledAutomatically = true;
         })
       );
     }
     await Promise.all(batch);
   }
 
-  // Finalize & assemble parallel chunks on cPanel
-  const assembleUrl = `${callbackBaseUrl}${sep}assemble=1&total=${totalChunks}`;
-  const finRes = await fetch(assembleUrl, { method: 'POST' });
-  if (!finRes.ok) {
-    throw new Error(`Assemble failed: HTTP ${finRes.status}`);
+  // Fallback assemble call if not already auto-assembled on final chunk
+  if (!assembledAutomatically) {
+    const assembleUrl = `${callbackBaseUrl}${sep}assemble=1&total=${totalChunks}`;
+    const finRes = await fetch(assembleUrl, { method: 'POST' });
+    if (!finRes.ok) {
+      throw new Error(`Assemble failed: HTTP ${finRes.status}`);
+    }
   }
   return buf.length;
 }
@@ -163,7 +168,7 @@ async function handler(req, res) {
       const checkUrl = `https://gencpu.com/api/v1/media/${encodeURIComponent(jobId)}.mp4?upscale=${encodeURIComponent(targetLabel)}&download=1`;
       const headRes = await fetch(checkUrl, { method: 'HEAD' });
       const len = Number(headRes.headers.get('content-length') || 0);
-      const minBytes = targetLabel === '1080p' ? 4000000 : 12000000;
+      const minBytes = 3000000;
       if (headRes.status === 200 && len >= minBytes) {
         const sizeMb = Number((len / (1024 * 1024)).toFixed(2));
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -217,9 +222,9 @@ async function handler(req, res) {
 
     const is4K = targetLabel === '4K';
     const vf = `scale=${targetW}:${targetH}:flags=fast_bilinear,unsharp=3:3:0.8:3:3:0.0`;
-    const crfVal = is4K ? '22' : '20';
-    const maxRate = is4K ? '16M' : '11M';
-    const bufSize = is4K ? '32M' : '22M';
+    const crfVal = is4K ? '23' : '22';
+    const maxRate = is4K ? '9M' : '6M';
+    const bufSize = is4K ? '18M' : '12M';
     const args = [
       '-y', '-hide_banner', '-nostats', '-loglevel', 'error',
       '-threads', '0',
