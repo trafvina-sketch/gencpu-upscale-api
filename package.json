@@ -1,0 +1,12 @@
+{
+  "name": "gencpu-cloud-upscale-worker",
+  "version": "1.0.0",
+  "description": "Standalone H3 Pro Video Upscale Microservice (Lanczos + CAS + Unsharp) for Vercel / Render / Railway / Docker",
+  "main": "api/upscale.js",
+  "scripts": {
+    "start": "node api/upscale.js"
+  },
+  "dependencies": {
+    "ffmpeg-static": "^5.2.0"
+  }
+}
