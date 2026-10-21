@@ -167,7 +167,7 @@ async function handler(req, res) {
       '-profile:v', 'high',
       '-pix_fmt', 'yuv420p',
       '-crf', '17',
-      '-preset', 'superfast',
+      '-preset', 'ultrafast',
       '-threads', '2',
       '-c:a', 'copy',
       '-movflags', '+faststart',
