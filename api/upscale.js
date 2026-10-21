@@ -52,17 +52,31 @@ async function uploadFileInChunks(filePath, callbackBaseUrl) {
   const totalChunks = Math.max(1, Math.ceil(buf.length / CHUNK_SIZE));
   const sep = callbackBaseUrl.includes('?') ? '&' : '?';
 
-  for (let i = 0; i < totalChunks; i++) {
-    const slice = buf.subarray(i * CHUNK_SIZE, Math.min(buf.length, (i + 1) * CHUNK_SIZE));
-    const url = `${callbackBaseUrl}${sep}chunk=${i}&total=${totalChunks}`;
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/octet-stream' },
-      body: slice
-    });
-    if (!r.ok) {
-      throw new Error(`Upload chunk ${i + 1}/${totalChunks} failed: HTTP ${r.status}`);
+  // Upload chunks in parallel batches of 5 for 4x faster transfer to cPanel
+  const CONCURRENCY = 5;
+  for (let start = 0; start < totalChunks; start += CONCURRENCY) {
+    const batch = [];
+    for (let i = start; i < Math.min(totalChunks, start + CONCURRENCY); i++) {
+      const slice = buf.subarray(i * CHUNK_SIZE, Math.min(buf.length, (i + 1) * CHUNK_SIZE));
+      const url = `${callbackBaseUrl}${sep}chunk=${i}&total=${totalChunks}&parallel=1`;
+      batch.push(
+        fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: slice
+        }).then(r => {
+          if (!r.ok) throw new Error(`Upload chunk ${i + 1}/${totalChunks} failed: HTTP ${r.status}`);
+        })
+      );
     }
+    await Promise.all(batch);
+  }
+
+  // Finalize & assemble parallel chunks on cPanel
+  const assembleUrl = `${callbackBaseUrl}${sep}assemble=1&total=${totalChunks}`;
+  const finRes = await fetch(assembleUrl, { method: 'POST' });
+  if (!finRes.ok) {
+    throw new Error(`Assemble failed: HTTP ${finRes.status}`);
   }
   return buf.length;
 }
@@ -140,7 +154,26 @@ async function handler(req, res) {
   const t0 = Date.now();
 
   try {
-    await downloadToFile(sourceUrl, inPath);
+    let downloaded = false;
+    if (body.cdnUrl) {
+      try {
+        await downloadToFile(body.cdnUrl, inPath);
+        if (fs.existsSync(inPath) && fs.statSync(inPath).size > 20000) downloaded = true;
+      } catch (e) {}
+    }
+    if (!downloaded && sourceUrl.includes('/api/v1/media/')) {
+      try {
+        const metaUrl = sourceUrl + (sourceUrl.includes('?') ? '&' : '?') + 'json=1';
+        const metaRes = await fetch(metaUrl).then(r => r.json()).catch(() => null);
+        if (metaRes && metaRes.directCdnUrl) {
+          await downloadToFile(metaRes.directCdnUrl, inPath);
+          if (fs.existsSync(inPath) && fs.statSync(inPath).size > 20000) downloaded = true;
+        }
+      } catch (e) {}
+    }
+    if (!downloaded) {
+      await downloadToFile(sourceUrl, inPath);
+    }
     const dims = await probeVideoDimensions(inPath);
     const inW = dims.width || 1920;
     const inH = dims.height || 1080;
@@ -157,18 +190,24 @@ async function handler(req, res) {
     targetW = targetW - (targetW % 2);
     targetH = targetH - (targetH % 2);
 
-    const vf = `scale=${targetW}:${targetH}:flags=lanczos+accurate_rnd+full_chroma_int,cas=0.65,unsharp=5:5:0.8:3:3:0.4`;
+    const is4K = targetLabel === '4K';
+    const vf = is4K
+      ? `scale=${targetW}:${targetH}:flags=bicubic,unsharp=3:3:0.75:3:3:0.0`
+      : `scale=${targetW}:${targetH}:flags=lanczos,unsharp=3:3:0.85:3:3:0.0`;
+    const crfVal = is4K ? '20' : '18';
     const args = [
       '-y', '-hide_banner',
-      '-threads', '2',
+      '-threads', '0',
       '-i', inPath,
       '-vf', vf,
       '-c:v', 'libx264',
       '-profile:v', 'high',
       '-pix_fmt', 'yuv420p',
-      '-crf', '17',
+      '-crf', crfVal,
       '-preset', 'ultrafast',
-      '-threads', '2',
+      '-tune', 'fastdecode',
+      '-x264-params', 'ref=1:subme=1:me=dia:trellis=0:aq-mode=1',
+      '-threads', '0',
       '-c:a', 'copy',
       '-movflags', '+faststart',
       outPath
