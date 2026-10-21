@@ -154,26 +154,10 @@ async function handler(req, res) {
   const t0 = Date.now();
 
   try {
-    let downloaded = false;
-    if (body.cdnUrl) {
-      try {
-        await downloadToFile(body.cdnUrl, inPath);
-        if (fs.existsSync(inPath) && fs.statSync(inPath).size > 20000) downloaded = true;
-      } catch (e) {}
-    }
-    if (!downloaded && sourceUrl.includes('/api/v1/media/')) {
-      try {
-        const metaUrl = sourceUrl + (sourceUrl.includes('?') ? '&' : '?') + 'json=1';
-        const metaRes = await fetch(metaUrl).then(r => r.json()).catch(() => null);
-        if (metaRes && metaRes.directCdnUrl) {
-          await downloadToFile(metaRes.directCdnUrl, inPath);
-          if (fs.existsSync(inPath) && fs.statSync(inPath).size > 20000) downloaded = true;
-        }
-      } catch (e) {}
-    }
-    if (!downloaded) {
-      await downloadToFile(sourceUrl, inPath);
-    }
+    const tDl0 = Date.now();
+    await downloadToFile(sourceUrl, inPath);
+    const dlMs = Date.now() - tDl0;
+
     const dims = await probeVideoDimensions(inPath);
     const inW = dims.width || 1920;
     const inH = dims.height || 1080;
@@ -191,22 +175,24 @@ async function handler(req, res) {
     targetH = targetH - (targetH % 2);
 
     const is4K = targetLabel === '4K';
-    const vf = is4K
-      ? `scale=${targetW}:${targetH}:flags=bicubic,unsharp=3:3:0.75:3:3:0.0`
-      : `scale=${targetW}:${targetH}:flags=lanczos,unsharp=3:3:0.85:3:3:0.0`;
-    const crfVal = is4K ? '20' : '18';
+    const vf = `scale=${targetW}:${targetH}:flags=fast_bilinear,unsharp=3:3:0.8:3:3:0.0`;
+    const crfVal = is4K ? '22' : '20';
+    const maxRate = is4K ? '16M' : '11M';
+    const bufSize = is4K ? '32M' : '22M';
     const args = [
       '-y', '-hide_banner', '-nostats', '-loglevel', 'error',
       '-threads', '0',
       '-i', inPath,
       '-vf', vf,
       '-c:v', 'libx264',
-      '-profile:v', 'high',
+      '-profile:v', 'main',
       '-pix_fmt', 'yuv420p',
       '-crf', crfVal,
+      '-maxrate', maxRate,
+      '-bufsize', bufSize,
       '-preset', 'ultrafast',
       '-tune', 'fastdecode',
-      '-x264-params', 'ref=1:subme=1:me=dia:trellis=0:aq-mode=1',
+      '-x264-params', 'ref=1:subme=0:me=dia:trellis=0:aq-mode=0:scenecut=0:bframes=0:weightp=0:cabac=0',
       '-threads', '0',
       '-c:a', 'copy',
       '-movflags', '+faststart',
