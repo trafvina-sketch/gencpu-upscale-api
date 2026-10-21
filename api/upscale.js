@@ -26,9 +26,29 @@ function downloadToFile(urlStr, destPath) {
   });
 }
 
+function probeVideoDimensions(filePath) {
+  return new Promise((resolve) => {
+    const proc = spawn(ffmpegPath, ['-hide_banner', '-i', filePath], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env: { ...process.env, MALLOC_ARENA_MAX: '2' }
+    });
+    let errBuf = '';
+    proc.stderr.on('data', d => { errBuf += d.toString(); });
+    proc.on('close', () => {
+      const m = errBuf.match(/Video:.*?\s(\d{3,5})x(\d{3,5})/);
+      if (m) {
+        resolve({ width: parseInt(m[1], 10), height: parseInt(m[2], 10) });
+      } else {
+        resolve({ width: 1920, height: 1080 });
+      }
+    });
+    proc.on('error', () => resolve({ width: 1920, height: 1080 }));
+  });
+}
+
 async function uploadFileInChunks(filePath, callbackBaseUrl) {
   const buf = fs.readFileSync(filePath);
-  const CHUNK_SIZE = 3 * 1024 * 1024; // 3MB per chunk (vượt mọi giới hạn Vercel 4.5MB & PHP post_max_size)
+  const CHUNK_SIZE = 3 * 1024 * 1024; // 3MB per chunk
   const totalChunks = Math.max(1, Math.ceil(buf.length / CHUNK_SIZE));
   const sep = callbackBaseUrl.includes('?') ? '&' : '?';
 
@@ -71,9 +91,8 @@ async function handler(req, res) {
     jobId = 'video',
     sourceUrl,
     uploadCallbackUrl,
-    target = '2K',
-    targetW = 2560,
-    targetH = 1440
+    target: rawTarget = '2K',
+    force = false
   } = body;
 
   if (!sourceUrl) {
@@ -81,13 +100,63 @@ async function handler(req, res) {
     return res.end(JSON.stringify({ ok: false, error: 'Missing sourceUrl' }));
   }
 
+  const targetStr = String(rawTarget || '2K').trim().toUpperCase();
+  let base = [2560, 1440];
+  let targetLabel = '2K';
+  if (targetStr.includes('1080')) {
+    base = [1920, 1080];
+    targetLabel = '1080p';
+  } else if (targetStr.includes('4K') || targetStr.includes('2160')) {
+    base = [3840, 2160];
+    targetLabel = '4K';
+  }
+
+  // Kiểm tra nhanh nếu trên máy chủ chính đã có sẵn bản Upscale này -> trả về ngay lập tức (0.1s)
+  if (!force && jobId && jobId !== 'video') {
+    try {
+      const checkUrl = `https://gencpu.com/api/v1/media/${encodeURIComponent(jobId)}.mp4?upscale=${encodeURIComponent(targetLabel)}&download=1`;
+      const headRes = await fetch(checkUrl, { method: 'HEAD' });
+      const len = Number(headRes.headers.get('content-length') || 0);
+      const minBytes = targetLabel === '1080p' ? 4000000 : 12000000;
+      if (headRes.status === 200 && len >= minBytes) {
+        const sizeMb = Number((len / (1024 * 1024)).toFixed(2));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          ok: true,
+          cached: true,
+          target: targetLabel,
+          size: len,
+          sizeMb,
+          downloadUrl: `/api/v1/media/${jobId}.mp4?upscale=${targetLabel}&download=1&v=${Date.now()}`,
+          url: `/api/v1/media/${jobId}.mp4?upscale=${targetLabel}&download=1&v=${Date.now()}`
+        }));
+      }
+    } catch (e) {}
+  }
+
   const id = `${jobId}_${Date.now()}`;
   const inPath = path.join(os.tmpdir(), `${id}_in.mp4`);
-  const outPath = path.join(os.tmpdir(), `${id}_out_${target}.mp4`);
+  const outPath = path.join(os.tmpdir(), `${id}_out_${targetLabel}.mp4`);
   const t0 = Date.now();
 
   try {
     await downloadToFile(sourceUrl, inPath);
+    const dims = await probeVideoDimensions(inPath);
+    const inW = dims.width || 1920;
+    const inH = dims.height || 1080;
+
+    let targetW = base[0];
+    let targetH = base[1];
+    if (inH > inW) {
+      targetW = base[1];
+      targetH = base[0]; // Dọc 9:16
+    } else if (inW === inH) {
+      targetW = base[1];
+      targetH = base[1]; // Vuông 1:1
+    }
+    targetW = targetW - (targetW % 2);
+    targetH = targetH - (targetH % 2);
+
     const vf = `scale=${targetW}:${targetH}:flags=lanczos+accurate_rnd+full_chroma_int,cas=0.65,unsharp=5:5:0.8:3:3:0.4`;
     const args = [
       '-y', '-hide_banner',
@@ -115,7 +184,7 @@ async function handler(req, res) {
     });
 
     if (code !== 0 || !fs.existsSync(outPath)) {
-      throw new Error('FFmpeg upscale failed on worker');
+      throw new Error('FFmpeg upscale failed on Vercel worker');
     }
 
     if (uploadCallbackUrl) {
@@ -128,12 +197,17 @@ async function handler(req, res) {
       return res.end(JSON.stringify({
         ok: true,
         uploaded: true,
-        target,
+        offloaded: true,
+        target: targetLabel,
+        inWidth: inW,
+        inHeight: inH,
         width: targetW,
         height: targetH,
         size: totalBytes,
         sizeMb,
-        elapsedSec
+        elapsedSec,
+        downloadUrl: `/api/v1/media/${jobId}.mp4?upscale=${targetLabel}&download=1&v=${Date.now()}`,
+        url: `/api/v1/media/${jobId}.mp4?upscale=${targetLabel}&download=1&v=${Date.now()}`
       }));
     }
 
